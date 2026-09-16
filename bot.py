@@ -12,10 +12,11 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
+
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = os.getenv("GUILD_ID")  # 任意。開発中に即時反映させたい場合はサーバーIDを設定
+GUILD_ID = os.getenv("GUILD_ID")  # 開発中だけ設定するとスラッシュコマンドが即時反映される
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "todos.db")
 
@@ -27,7 +28,7 @@ EVERYONE_ONLY = discord.AllowedMentions(everyone=True, roles=False, users=False)
 
 MAX_PENDING_LINES = 15
 MAX_DONE_LINES = 5
-REMINDER_STALE_AFTER = timedelta(hours=24)  # これより古い未送信リマインドは送らず「処理済み」にする
+REMINDER_STALE_AFTER = timedelta(hours=24)
 
 DEADLINE_EXAMPLE_TEXT = (
     "日時の形式を認識できませんでした。次のような形式で入力してください。\n"
@@ -50,9 +51,9 @@ NOTIFY_CHOICES = [
 # ============================================================
 
 def init_db():
+    """既存のTodoを残したまま、必要なテーブル・列を用意する。"""
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     with closing(sqlite3.connect(DB_PATH)) as conn:
-        # 既存インストールとの互換性のため、まず元のスキーマでテーブルを作成する
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS todos (
@@ -67,25 +68,22 @@ def init_db():
             """
         )
 
-        # 既存データを消さずに新しい列だけ追加する（自動マイグレーション）
         existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(todos)").fetchall()}
         if "deadline_utc" not in existing_cols:
             conn.execute("ALTER TABLE todos ADD COLUMN deadline_utc TEXT")
         if "notify_type" not in existing_cols:
             conn.execute("ALTER TABLE todos ADD COLUMN notify_type TEXT NOT NULL DEFAULT 'none'")
 
-        # 固定Todoボードのメッセージ情報を保存するテーブル
+        # guild_idを主キーにすることで、サーバーごとにボードを必ず1つにする。
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS boards (
-                channel_id INTEGER PRIMARY KEY,
-                guild_id INTEGER NOT NULL,
+            CREATE TABLE IF NOT EXISTS todo_boards (
+                guild_id INTEGER PRIMARY KEY,
+                channel_id INTEGER NOT NULL,
                 message_id INTEGER
             )
             """
         )
-
-        # 送信済みリマインドを記録するテーブル（再起動しても二重送信しないため）
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS reminder_log (
@@ -96,11 +94,26 @@ def init_db():
             )
             """
         )
+
+        # 旧バージョンのboardsテーブルがあれば、最初の1件を新しい形式へ引き継ぐ。
+        legacy_board_table = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'boards'"
+        ).fetchone()
+        if legacy_board_table:
+            legacy_rows = conn.execute(
+                "SELECT guild_id, channel_id, message_id FROM boards ORDER BY rowid ASC"
+            ).fetchall()
+            for guild_id, channel_id, message_id in legacy_rows:
+                conn.execute(
+                    "INSERT OR IGNORE INTO todo_boards (guild_id, channel_id, message_id) VALUES (?, ?, ?)",
+                    (guild_id, channel_id, message_id),
+                )
+
         conn.commit()
 
 
 # ============================================================
-# 日時パース（JST / 自然な入力を受け付ける）
+# 日時パース（JST）
 # ============================================================
 
 _RELATIVE_DAY = {"今日": 0, "明日": 1, "明後日": 2}
@@ -111,69 +124,64 @@ def now_utc() -> datetime:
 
 
 def parse_deadline(text: str, reference: datetime) -> Optional[datetime]:
-    """ユーザー入力の日時文字列をJST awareなdatetimeに変換する。認識できなければNone。"""
+    """JSTで解釈した日時を返す。認識できない入力はNone。"""
     text = unicodedata.normalize("NFKC", text).strip().replace("　", " ")
     ref_jst = reference.astimezone(JST)
 
-    # 例: 明日18時 / 明日18時30分 / 今日9:00
-    m = re.match(r"^(今日|明日|明後日)\s*(\d{1,2})時(?:\s*(\d{1,2})分)?$", text)
-    if not m:
-        m = re.match(r"^(今日|明日|明後日)\s*(\d{1,2}):(\d{2})$", text)
-    if m:
-        day_word, hh, mm = m.group(1), int(m.group(2)), int(m.group(3) or 0)
-        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+    # 明日18時 / 明日18時30分 / 今日9:00
+    match = re.match(r"^(今日|明日|明後日)\s*(\d{1,2})時(?:\s*(\d{1,2})分)?$", text)
+    if not match:
+        match = re.match(r"^(今日|明日|明後日)\s*(\d{1,2}):(\d{2})$", text)
+    if match:
+        day_word, hour, minute = match.group(1), int(match.group(2)), int(match.group(3) or 0)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
             return None
         target_date = (ref_jst + timedelta(days=_RELATIVE_DAY[day_word])).date()
-        try:
-            return datetime(target_date.year, target_date.month, target_date.day, hh, mm, tzinfo=JST)
-        except ValueError:
-            return None
+        return datetime(target_date.year, target_date.month, target_date.day, hour, minute, tzinfo=JST)
 
-    # 例: 9/30 23:59 （年省略、過ぎていれば翌年に繰り上げ）
-    m = re.match(r"^(\d{1,2})/(\d{1,2})\s+(\d{1,2}):(\d{2})$", text)
-    if m:
-        month, day, hh, mm = map(int, m.groups())
-        year = ref_jst.year
+    # 9/30 23:59（年省略。すでに過ぎていたら翌年）
+    match = re.match(r"^(\d{1,2})/(\d{1,2})\s+(\d{1,2}):(\d{2})$", text)
+    if match:
+        month, day, hour, minute = map(int, match.groups())
         try:
-            dt = datetime(year, month, day, hh, mm, tzinfo=JST)
+            result = datetime(ref_jst.year, month, day, hour, minute, tzinfo=JST)
         except ValueError:
             return None
-        if dt < ref_jst - timedelta(minutes=1):
+        if result < ref_jst - timedelta(minutes=1):
             try:
-                dt = dt.replace(year=year + 1)
+                result = result.replace(year=result.year + 1)
             except ValueError:
                 return None
-        return dt
+        return result
 
-    # 例: 9/30 （時刻省略時は23:59とみなす）
-    m = re.match(r"^(\d{1,2})/(\d{1,2})$", text)
-    if m:
-        month, day = map(int, m.groups())
-        year = ref_jst.year
+    # 9/30（時刻は23:59扱い）
+    match = re.match(r"^(\d{1,2})/(\d{1,2})$", text)
+    if match:
+        month, day = map(int, match.groups())
         try:
-            dt = datetime(year, month, day, 23, 59, tzinfo=JST)
+            result = datetime(ref_jst.year, month, day, 23, 59, tzinfo=JST)
         except ValueError:
             return None
-        if dt < ref_jst - timedelta(minutes=1):
+        if result < ref_jst - timedelta(minutes=1):
             try:
-                dt = dt.replace(year=year + 1)
+                result = result.replace(year=result.year + 1)
             except ValueError:
                 return None
-        return dt
+        return result
 
-    # 例: 2026-09-30 18:00 / 2026/09/30 18:00
-    m = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s+(\d{1,2}):(\d{2})$", text)
-    if m:
-        year, month, day, hh, mm = map(int, m.groups())
+    # 2026-09-30 18:00 / 2026/09/30 18:00
+    match = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s+(\d{1,2}):(\d{2})$", text)
+    if match:
+        year, month, day, hour, minute = map(int, match.groups())
         try:
-            return datetime(year, month, day, hh, mm, tzinfo=JST)
+            return datetime(year, month, day, hour, minute, tzinfo=JST)
         except ValueError:
             return None
 
-    # 例: 2026-09-30 （時刻省略時は23:59とみなす）
-    m = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$", text)
-    if m:
-        year, month, day = map(int, m.groups())
+    # 2026-09-30（時刻は23:59扱い）
+    match = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$", text)
+    if match:
+        year, month, day = map(int, match.groups())
         try:
             return datetime(year, month, day, 23, 59, tzinfo=JST)
         except ValueError:
@@ -182,46 +190,49 @@ def parse_deadline(text: str, reference: datetime) -> Optional[datetime]:
     return None
 
 
+def get_deadline_dt(row: sqlite3.Row) -> Optional[datetime]:
+    value = row["deadline_utc"]
+    if not value:
+        return None
+    result = datetime.fromisoformat(value)
+    if result.tzinfo is None:
+        result = result.replace(tzinfo=UTC)
+    return result.astimezone(UTC)
+
+
 def format_jst(dt_utc: datetime) -> str:
     dt = dt_utc.astimezone(JST)
     return f"{dt.month}/{dt.day} {dt.hour:02d}:{dt.minute:02d}"
 
 
-def get_deadline_dt(row: sqlite3.Row) -> Optional[datetime]:
-    if row["deadline_utc"]:
-        return datetime.fromisoformat(row["deadline_utc"])
-    return None
-
-
 # ============================================================
-# DBアクセス系ヘルパー
+# DBアクセス
 # ============================================================
 
-def get_channel_todos(channel_id: int, include_done: bool = True):
+def get_guild_todos(guild_id: int):
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
-        query = "SELECT * FROM todos WHERE channel_id = ?"
-        params = [channel_id]
-        if not include_done:
-            query += " AND done = 0"
-        query += " ORDER BY id ASC"
-        return conn.execute(query, params).fetchall()
+        return conn.execute(
+            "SELECT * FROM todos WHERE guild_id = ? ORDER BY id ASC", (guild_id,)
+        ).fetchall()
 
 
-def get_board_row(channel_id: int):
+def get_board_row(guild_id: int):
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
-        return conn.execute("SELECT * FROM boards WHERE channel_id = ?", (channel_id,)).fetchone()
+        return conn.execute("SELECT * FROM todo_boards WHERE guild_id = ?", (guild_id,)).fetchone()
 
 
-def upsert_board_row(channel_id: int, guild_id: int, message_id: Optional[int]):
+def save_board(guild_id: int, channel_id: int, message_id: int):
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.execute(
             """
-            INSERT INTO boards (channel_id, guild_id, message_id) VALUES (?, ?, ?)
-            ON CONFLICT(channel_id) DO UPDATE SET message_id = excluded.message_id, guild_id = excluded.guild_id
+            INSERT INTO todo_boards (guild_id, channel_id, message_id) VALUES (?, ?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                channel_id = excluded.channel_id,
+                message_id = excluded.message_id
             """,
-            (channel_id, guild_id, message_id),
+            (guild_id, channel_id, message_id),
         )
         conn.commit()
 
@@ -233,76 +244,67 @@ def delete_reminder_log(todo_id: int):
 
 
 # ============================================================
-# 固定Todoボード
+# Todoボード（guildに1つ）
 # ============================================================
 
-def build_board_embed(rows, now: datetime) -> discord.Embed:
-    idx_rows = list(enumerate(rows, start=1))
-    pending = [(i, r) for i, r in idx_rows if not r["done"]]
-    done = [(i, r) for i, r in idx_rows if r["done"]]
+def format_pending_line(number: int, row: sqlite3.Row, now: datetime) -> str:
+    deadline = get_deadline_dt(row)
+    if deadline is None:
+        return f"⬜ **{number}.** {row['task']}"
 
-    def urgency_rank(item):
-        i, r = item
-        deadline = get_deadline_dt(r)
+    if row["notify_type"] == "scheduled":
+        icon = "🔴" if deadline <= now else "🕐"
+        return f"{icon} **{number}.** {row['task']}　{format_jst(deadline)} に通知"
+
+    if deadline <= now:
+        icon = "🔴"
+    elif deadline - now <= timedelta(hours=24):
+        icon = "🟡"
+    else:
+        icon = "⬜"
+    return f"{icon} **{number}.** {row['task']}　締切: {format_jst(deadline)}"
+
+
+def build_board_embed(rows, now: datetime) -> discord.Embed:
+    indexed_rows = list(enumerate(rows, start=1))
+    pending = [(number, row) for number, row in indexed_rows if not row["done"]]
+    done = [(number, row) for number, row in indexed_rows if row["done"]]
+
+    def urgency(item):
+        _, row = item
+        deadline = get_deadline_dt(row)
         if deadline is None:
             return (3, datetime.max.replace(tzinfo=UTC))
-        if r["notify_type"] == "scheduled":
-            rank = 0 if deadline <= now else 2
-        else:
-            if deadline <= now:
-                rank = 0
-            elif deadline - now <= timedelta(hours=24):
-                rank = 1
-            else:
-                rank = 2
-        return (rank, deadline)
+        if row["notify_type"] == "scheduled":
+            return (0 if deadline <= now else 2, deadline)
+        if deadline <= now:
+            return (0, deadline)
+        if deadline - now <= timedelta(hours=24):
+            return (1, deadline)
+        return (2, deadline)
 
-    pending_sorted = sorted(pending, key=urgency_rank)
+    pending.sort(key=urgency)
+    lines = [format_pending_line(number, row, now) for number, row in pending[:MAX_PENDING_LINES]]
+    if not lines:
+        lines = ["（未完了のタスクはありません）"]
+    if len(pending) > MAX_PENDING_LINES:
+        lines.append(f"…ほか{len(pending) - MAX_PENDING_LINES}件")
 
-    lines = []
-    shown_pending = pending_sorted[:MAX_PENDING_LINES]
-    hidden_pending = len(pending_sorted) - len(shown_pending)
-    if not pending_sorted:
-        lines.append("（未完了のタスクはありません）")
-    for i, r in shown_pending:
-        lines.append(format_pending_line(i, r, now))
-    if hidden_pending > 0:
-        lines.append(f"…ほか{hidden_pending}件")
-
-    embed = discord.Embed(title="📋 Todoボード", description="\n".join(lines), color=discord.Color.blurple())
+    embed = discord.Embed(
+        title="📋 Todoボード",
+        description="\n".join(lines),
+        color=discord.Color.blurple(),
+    )
 
     if done:
-        shown_done = done[-MAX_DONE_LINES:]
-        hidden_done = len(done) - len(shown_done)
-        done_lines = [f"~~{i}. {r['task']}~~" for i, r in shown_done]
-        if hidden_done > 0:
-            done_lines.append(f"…ほか{hidden_done}件")
+        done_lines = [f"~~{number}. {row['task']}~~" for number, row in done[-MAX_DONE_LINES:]]
+        if len(done) > MAX_DONE_LINES:
+            done_lines.append(f"…ほか{len(done) - MAX_DONE_LINES}件")
         embed.add_field(name="✅ 完了済み", value="\n".join(done_lines), inline=False)
 
-    updated_jst = now.astimezone(JST)
-    embed.set_footer(
-        text=f"最終更新: {updated_jst.strftime('%Y/%m/%d %H:%M')} (JST) ／ /todo done, /todo remove の番号と対応"
-    )
+    updated = now.astimezone(JST).strftime("%Y/%m/%d %H:%M")
+    embed.set_footer(text=f"最終更新: {updated} (JST) ／ /todo done・/todo remove の番号と対応")
     return embed
-
-
-def format_pending_line(i: int, r: sqlite3.Row, now: datetime) -> str:
-    deadline = get_deadline_dt(r)
-    if deadline is None:
-        return f"⬜ **{i}.** {r['task']}"
-
-    text = format_jst(deadline)
-    if r["notify_type"] == "scheduled":
-        icon = "🔴" if deadline <= now else "🕐"
-        return f"{icon} **{i}.** {r['task']}　{text} に通知"
-    else:
-        if deadline <= now:
-            icon = "🔴"
-        elif deadline - now <= timedelta(hours=24):
-            icon = "🟡"
-        else:
-            icon = "⬜"
-        return f"{icon} **{i}.** {r['task']}　締切: {text}"
 
 
 async def _resolve_channel(channel_id: int):
@@ -315,63 +317,55 @@ async def _resolve_channel(channel_id: int):
     return channel
 
 
-async def _write_board_message(channel_id: int, guild_id: int, board_row, force_new: bool):
-    channel = await _resolve_channel(channel_id)
+async def _delete_board_message(board_row):
+    if board_row is None or not board_row["message_id"]:
+        return
+    channel = await _resolve_channel(board_row["channel_id"])
     if channel is None:
         return
-
-    rows = get_channel_todos(channel_id)
-    embed = build_board_embed(rows, now_utc())
-
-    message_id = board_row["message_id"] if board_row else None
-
-    if force_new and message_id:
-        try:
-            old_msg = await channel.fetch_message(message_id)
-            await old_msg.delete()
-        except (discord.NotFound, discord.Forbidden):
-            pass
-        message_id = None
-
-    if message_id and not force_new:
-        try:
-            msg = await channel.fetch_message(message_id)
-            await msg.edit(embed=embed, allowed_mentions=NO_MENTIONS)
-            return
-        except discord.NotFound:
-            message_id = None  # ボードが削除されていた → 新規作成へフォールバック
-        except discord.Forbidden:
-            return
-
     try:
-        msg = await channel.send(embed=embed, allowed_mentions=NO_MENTIONS)
-        upsert_board_row(channel_id, guild_id, msg.id)
-    except discord.Forbidden:
+        message = await channel.fetch_message(board_row["message_id"])
+        await message.delete()
+    except (discord.NotFound, discord.Forbidden):
         pass
 
 
-async def refresh_board_if_configured(channel_id: int, guild_id: int):
-    """通常のTodo操作後に呼ぶ。/todo setup 済みのチャンネルだけ更新する。"""
-    board_row = get_board_row(channel_id)
+async def _create_board(guild_id: int, channel_id: int) -> Optional[discord.Message]:
+    channel = await _resolve_channel(channel_id)
+    if channel is None:
+        return None
+    try:
+        message = await channel.send(
+            embed=build_board_embed(get_guild_todos(guild_id), now_utc()),
+            allowed_mentions=NO_MENTIONS,
+        )
+    except discord.Forbidden:
+        return None
+    save_board(guild_id, channel_id, message.id)
+    return message
+
+
+async def refresh_board_if_configured(guild_id: int):
+    """登録済みの唯一のボードを編集する。削除済みなら同じチャンネルに作り直す。"""
+    board_row = get_board_row(guild_id)
     if board_row is None:
         return
+    channel = await _resolve_channel(board_row["channel_id"])
+    if channel is None:
+        return
+
+    embed = build_board_embed(get_guild_todos(guild_id), now_utc())
     try:
-        await _write_board_message(channel_id, guild_id, board_row, force_new=False)
-    except Exception as e:  # noqa: BLE001 - ボード更新の失敗でコマンド応答自体は止めない
-        print(f"[board] 更新中にエラー: {e}")
-
-
-async def setup_board(channel_id: int, guild_id: int):
-    """/todo setup 用。既存メッセージを削除して新規に作り直す。"""
-    board_row = get_board_row(channel_id)
-    if board_row is None:
-        upsert_board_row(channel_id, guild_id, None)
-        board_row = get_board_row(channel_id)
-    await _write_board_message(channel_id, guild_id, board_row, force_new=True)
+        message = await channel.fetch_message(board_row["message_id"])
+        await message.edit(embed=embed, allowed_mentions=NO_MENTIONS)
+    except discord.NotFound:
+        await _create_board(guild_id, board_row["channel_id"])
+    except discord.Forbidden:
+        print("[board] ボードを更新する権限がありません。")
 
 
 # ============================================================
-# Bot 本体
+# Bot 本体・コマンド
 # ============================================================
 
 intents = discord.Intents.default()
@@ -388,11 +382,12 @@ class TodoBot(commands.Bot):
 
 
 bot = TodoBot(command_prefix="!", intents=intents)
+todo_group = app_commands.Group(name="todo", description="個人用Todoメモを管理します")
+board_group = app_commands.Group(name="board", description="Todoボードを管理します")
+todo_group.add_command(board_group)
 
-todo_group = app_commands.Group(name="todo", description="このチャンネルのTodoリストを管理します")
 
-
-async def reply(interaction: discord.Interaction, text: str, ephemeral: bool = False):
+async def reply(interaction: discord.Interaction, text: str, ephemeral: bool = True):
     if interaction.response.is_done():
         await interaction.followup.send(text, allowed_mentions=NO_MENTIONS, ephemeral=ephemeral)
     else:
@@ -405,17 +400,41 @@ def validate_number(rows, number: int) -> Optional[sqlite3.Row]:
     return rows[number - 1]
 
 
-# ---------------- /todo setup ----------------
-
-@todo_group.command(name="setup", description="このチャンネルに固定Todoボードを作成（または再作成）します")
+@todo_group.command(name="setup", description="このチャンネルに唯一のTodoボードを作成します")
 @app_commands.guild_only()
 async def todo_setup(interaction: discord.Interaction):
-    await interaction.response.defer()
-    await setup_board(interaction.channel_id, interaction.guild_id)
-    await reply(interaction, "📋 このチャンネルにTodoボードを作成しました。以後、追加・完了・削除のたびに自動更新されます。")
+    board_row = get_board_row(interaction.guild_id)
+    if board_row is not None:
+        await reply(
+            interaction,
+            f"📋 Todoボードはすでに <#{board_row['channel_id']}> にあります。"
+            "移動・作り直しは `/todo board reset` を使ってください。",
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    message = await _create_board(interaction.guild_id, interaction.channel_id)
+    if message is None:
+        await reply(interaction, "⚠️ このチャンネルにTodoボードを送信できませんでした。Botの権限を確認してください。")
+        return
+    await reply(interaction, "📋 このチャンネルをTodoボードとして登録しました。以後どこから追加しても、ここだけが更新されます。")
 
 
-# ---------------- /todo add ----------------
+@board_group.command(name="reset", description="このチャンネルへTodoボードを移動・作り直しします（Todoは消えません）")
+@app_commands.guild_only()
+async def todo_board_reset(interaction: discord.Interaction):
+    old_board = get_board_row(interaction.guild_id)
+    await interaction.response.defer(ephemeral=True)
+
+    # 新しいボード作成を先に試し、失敗した場合に古いボードを失わないようにする。
+    message = await _create_board(interaction.guild_id, interaction.channel_id)
+    if message is None:
+        await reply(interaction, "⚠️ このチャンネルにTodoボードを送信できませんでした。古いボードはそのままです。")
+        return
+    if old_board is not None and old_board["message_id"] != message.id:
+        await _delete_board_message(old_board)
+    await reply(interaction, "📋 Todoボードをこのチャンネルへ移動・作り直ししました。Todoはそのまま残っています。")
+
 
 @todo_group.command(name="add", description="Todoを追加します（期限・通知は任意）")
 @app_commands.describe(
@@ -433,58 +452,46 @@ async def todo_add(
 ):
     deadline_dt = None
     notify_value = "none"
-
     if deadline is None:
         if notify is not None and notify.value != "none":
-            await reply(
-                interaction,
-                "⚠️ 期限(deadline)が未指定のため通知は設定できません。\n"
-                "例: `/todo add task:レポート提出 deadline:9/30 23:59 notify:deadline`",
-                ephemeral=True,
-            )
+            await reply(interaction, "⚠️ 期限(deadline)が未指定のため通知は設定できません。", ephemeral=True)
             return
     else:
         deadline_dt = parse_deadline(deadline, now_utc())
         if deadline_dt is None:
-            await reply(interaction, f"⚠️ {DEADLINE_EXAMPLE_TEXT}", ephemeral=True)
+            await reply(interaction, f"⚠️ {DEADLINE_EXAMPLE_TEXT}")
             return
         notify_value = notify.value if notify else "scheduled"
 
-    await interaction.response.defer()
-
-    deadline_utc_iso = deadline_dt.astimezone(UTC).isoformat() if deadline_dt else None
-
+    await interaction.response.defer(ephemeral=True)
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.execute(
-            "INSERT INTO todos (guild_id, channel_id, author_id, task, done, created_at, deadline_utc, notify_type) "
-            "VALUES (?, ?, ?, ?, 0, ?, ?, ?)",
+            """
+            INSERT INTO todos (guild_id, channel_id, author_id, task, done, created_at, deadline_utc, notify_type)
+            VALUES (?, ?, ?, ?, 0, ?, ?, ?)
+            """,
             (
                 interaction.guild_id,
-                interaction.channel_id,
+                interaction.channel_id,  # 履歴として保持するだけで、一覧の分類には使わない
                 interaction.user.id,
                 task,
                 now_utc().isoformat(),
-                deadline_utc_iso,
+                deadline_dt.astimezone(UTC).isoformat() if deadline_dt else None,
                 notify_value,
             ),
         )
         conn.commit()
 
-    await refresh_board_if_configured(interaction.channel_id, interaction.guild_id)
+    await refresh_board_if_configured(interaction.guild_id)
+    suffix = f"（{format_jst(deadline_dt)}）" if deadline_dt else ""
+    await reply(interaction, f"✅ タスクを追加しました: **{task}**{suffix}")
 
-    if deadline_dt:
-        await reply(interaction, f"✅ タスクを追加しました: **{task}**（{format_jst(deadline_dt)}）")
-    else:
-        await reply(interaction, f"✅ タスクを追加しました: **{task}**")
-
-
-# ---------------- /todo update ----------------
 
 @todo_group.command(name="update", description="タスク名・期限・通知方式を変更します")
 @app_commands.describe(
-    number="/todo list またはボードに表示された番号",
+    number="Todoボードに表示された番号",
     task="新しいタスク名（変更する場合のみ）",
-    deadline="新しい期限。例: 明日18時 / 9/30 23:59 ／ 'none'で期限を削除",
+    deadline="新しい期限。'none'で期限を削除",
     notify="新しい通知方式（期限がある場合のみ指定可）",
 )
 @app_commands.choices(notify=NOTIFY_CHOICES)
@@ -497,145 +504,116 @@ async def todo_update(
     notify: Optional[app_commands.Choice[str]] = None,
 ):
     if task is None and deadline is None and notify is None:
-        await reply(interaction, "⚠️ task / deadline / notify のいずれかを指定してください。", ephemeral=True)
+        await reply(interaction, "⚠️ task / deadline / notify のいずれかを指定してください。")
         return
 
-    rows = get_channel_todos(interaction.channel_id)
+    rows = get_guild_todos(interaction.guild_id)
     target = validate_number(rows, number)
     if target is None:
-        await reply(interaction, "その番号のタスクは見つかりませんでした。", ephemeral=True)
+        await reply(interaction, "その番号のタスクは見つかりませんでした。")
         return
 
     new_task = task if task is not None else target["task"]
-
-    clear_deadline = False
-    new_deadline_dt = None
-    if deadline is not None:
-        if deadline.strip().lower() in CLEAR_KEYWORDS:
-            clear_deadline = True
-        else:
-            new_deadline_dt = parse_deadline(deadline, now_utc())
-            if new_deadline_dt is None:
-                await reply(interaction, f"⚠️ {DEADLINE_EXAMPLE_TEXT}", ephemeral=True)
-                return
+    clear_deadline = deadline is not None and deadline.strip().lower() in CLEAR_KEYWORDS
+    if deadline is None:
+        new_deadline_dt = get_deadline_dt(target)
+    elif clear_deadline:
+        new_deadline_dt = None
     else:
-        existing = get_deadline_dt(target)
-        if existing is not None:
-            new_deadline_dt = existing
+        new_deadline_dt = parse_deadline(deadline, now_utc())
+        if new_deadline_dt is None:
+            await reply(interaction, f"⚠️ {DEADLINE_EXAMPLE_TEXT}")
+            return
 
-    final_has_deadline = (not clear_deadline) and (new_deadline_dt is not None)
     new_notify = notify.value if notify is not None else (target["notify_type"] or "none")
     if clear_deadline:
         new_notify = "none"
-    if not final_has_deadline and new_notify != "none":
-        await reply(interaction, "⚠️ 期限が設定されていないため、通知(notify)は指定できません。", ephemeral=True)
+    if new_deadline_dt is None and new_notify != "none":
+        await reply(interaction, "⚠️ 期限が設定されていないため、通知(notify)は指定できません。")
         return
 
-    await interaction.response.defer()
-
-    deadline_utc_iso = new_deadline_dt.astimezone(UTC).isoformat() if final_has_deadline else None
-
+    await interaction.response.defer(ephemeral=True)
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.execute(
             "UPDATE todos SET task = ?, deadline_utc = ?, notify_type = ? WHERE id = ?",
-            (new_task, deadline_utc_iso, new_notify, target["id"]),
+            (new_task, new_deadline_dt.astimezone(UTC).isoformat() if new_deadline_dt else None, new_notify, target["id"]),
         )
         conn.commit()
 
-    # スケジュールが変わったので、送信済みリマインド履歴はリセットする
-    delete_reminder_log(target["id"])
-
-    await refresh_board_if_configured(interaction.channel_id, interaction.guild_id)
+    # 名前だけの更新では通知済み履歴を残し、期限または通知方式を変えた時だけリセットする。
+    if deadline is not None or notify is not None:
+        delete_reminder_log(target["id"])
+    await refresh_board_if_configured(interaction.guild_id)
     await reply(interaction, f"✏️ タスクを更新しました: **{new_task}**")
 
 
-# ---------------- /todo list ----------------
-
-@todo_group.command(name="list", description="このチャンネルのTodo一覧を表示します（ボードを見失った場合の補助用）")
+@todo_group.command(name="list", description="サーバー全体のTodo一覧を一時表示します")
 @app_commands.guild_only()
 async def todo_list(interaction: discord.Interaction):
-    rows = get_channel_todos(interaction.channel_id)
+    rows = get_guild_todos(interaction.guild_id)
     if not rows:
-        await reply(
-            interaction,
-            "このチャンネルにはまだTodoがありません。`/todo add` で追加してください。",
-            ephemeral=True,
-        )
+        await reply(interaction, "Todoはまだありません。`/todo add` で追加してください。")
         return
-
     embed = build_board_embed(rows, now_utc())
     embed.title = "📋 Todoリスト（一時表示）"
     await interaction.response.send_message(embed=embed, allowed_mentions=NO_MENTIONS, ephemeral=True)
 
 
-# ---------------- /todo done ----------------
-
 @todo_group.command(name="done", description="指定した番号のTodoを完了にします")
-@app_commands.describe(number="ボードまたは /todo list に表示された番号")
+@app_commands.describe(number="Todoボードに表示された番号")
 @app_commands.guild_only()
 async def todo_done(interaction: discord.Interaction, number: int):
-    rows = get_channel_todos(interaction.channel_id)
+    rows = get_guild_todos(interaction.guild_id)
     target = validate_number(rows, number)
     if target is None:
-        await reply(interaction, "その番号のタスクは見つかりませんでした。", ephemeral=True)
+        await reply(interaction, "その番号のタスクは見つかりませんでした。")
         return
 
-    await interaction.response.defer()
-
+    await interaction.response.defer(ephemeral=True)
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.execute("UPDATE todos SET done = 1 WHERE id = ?", (target["id"],))
         conn.commit()
-
-    await refresh_board_if_configured(interaction.channel_id, interaction.guild_id)
+    await refresh_board_if_configured(interaction.guild_id)
     await reply(interaction, f"🎉 完了にしました: **{target['task']}**")
 
 
-# ---------------- /todo remove ----------------
-
 @todo_group.command(name="remove", description="指定した番号のTodoを削除します")
-@app_commands.describe(number="ボードまたは /todo list に表示された番号")
+@app_commands.describe(number="Todoボードに表示された番号")
 @app_commands.guild_only()
 async def todo_remove(interaction: discord.Interaction, number: int):
-    rows = get_channel_todos(interaction.channel_id)
+    rows = get_guild_todos(interaction.guild_id)
     target = validate_number(rows, number)
     if target is None:
-        await reply(interaction, "その番号のタスクは見つかりませんでした。", ephemeral=True)
+        await reply(interaction, "その番号のタスクは見つかりませんでした。")
         return
 
-    await interaction.response.defer()
-
+    await interaction.response.defer(ephemeral=True)
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.execute("DELETE FROM todos WHERE id = ?", (target["id"],))
+        conn.execute("DELETE FROM reminder_log WHERE todo_id = ?", (target["id"],))
         conn.commit()
-    delete_reminder_log(target["id"])
-
-    await refresh_board_if_configured(interaction.channel_id, interaction.guild_id)
+    await refresh_board_if_configured(interaction.guild_id)
     await reply(interaction, f"🗑️ 削除しました: **{target['task']}**")
 
 
-# ---------------- /todo clear ----------------
-
-@todo_group.command(name="clear", description="このチャンネルの完了済みTodoを一括削除します")
+@todo_group.command(name="clear", description="完了済みTodoを一括削除します")
 @app_commands.guild_only()
 async def todo_clear(interaction: discord.Interaction):
-    await interaction.response.defer()
-
+    await interaction.response.defer(ephemeral=True)
     with closing(sqlite3.connect(DB_PATH)) as conn:
         done_ids = [
-            r[0]
-            for r in conn.execute(
-                "SELECT id FROM todos WHERE channel_id = ? AND done = 1", (interaction.channel_id,)
+            row[0]
+            for row in conn.execute(
+                "SELECT id FROM todos WHERE guild_id = ? AND done = 1", (interaction.guild_id,)
             ).fetchall()
         ]
         if done_ids:
-            conn.executemany("DELETE FROM reminder_log WHERE todo_id = ?", [(i,) for i in done_ids])
-        cur = conn.execute(
-            "DELETE FROM todos WHERE channel_id = ? AND done = 1", (interaction.channel_id,)
-        )
+            conn.executemany("DELETE FROM reminder_log WHERE todo_id = ?", [(todo_id,) for todo_id in done_ids])
+        deleted = conn.execute(
+            "DELETE FROM todos WHERE guild_id = ? AND done = 1", (interaction.guild_id,)
+        ).rowcount
         conn.commit()
-        deleted = cur.rowcount
-
-    await refresh_board_if_configured(interaction.channel_id, interaction.guild_id)
+    await refresh_board_if_configured(interaction.guild_id)
     await reply(interaction, f"🧹 完了済みのタスクを {deleted} 件削除しました。")
 
 
@@ -643,15 +621,15 @@ bot.tree.add_command(todo_group)
 
 
 # ============================================================
-# 締切リマインド（バックグラウンドループ）
+# 締切リマインド
 # ============================================================
 
 @tasks.loop(seconds=60)
 async def reminder_loop():
     try:
         await check_and_send_reminders()
-    except Exception as e:  # noqa: BLE001 - ループ自体は絶対に止めない
-        print(f"[reminder_loop] 予期しないエラー: {e}")
+    except Exception as exc:  # 1回の想定外エラーでループを停止させない
+        print(f"[reminder_loop] 予期しないエラー: {exc}")
 
 
 async def check_and_send_reminders():
@@ -661,22 +639,20 @@ async def check_and_send_reminders():
         rows = conn.execute(
             "SELECT * FROM todos WHERE done = 0 AND deadline_utc IS NOT NULL AND notify_type != 'none'"
         ).fetchall()
-
     for row in rows:
         try:
-            await _process_todo_reminder(row, now)
-        except Exception as e:  # noqa: BLE001 - 1件の失敗で他のリマインドを止めない
-            print(f"[reminder] todo_id={row['id']} の処理でエラー: {e}")
+            await process_todo_reminder(row, now)
+        except Exception as exc:  # 1件の失敗で他の通知を止めない
+            print(f"[reminder] todo_id={row['id']} の処理でエラー: {exc}")
 
 
-async def _process_todo_reminder(row: sqlite3.Row, now: datetime):
-    todo_id = row["id"]
+async def process_todo_reminder(row: sqlite3.Row, now: datetime):
     deadline = get_deadline_dt(row)
-    notify_type = row["notify_type"]
-
-    if notify_type == "scheduled":
+    if deadline is None:
+        return
+    if row["notify_type"] == "scheduled":
         milestones = [("at", deadline)]
-    elif notify_type == "deadline":
+    elif row["notify_type"] == "deadline":
         milestones = [
             ("d3", deadline - timedelta(days=3)),
             ("d1", deadline - timedelta(days=1)),
@@ -686,52 +662,44 @@ async def _process_todo_reminder(row: sqlite3.Row, now: datetime):
         return
 
     with closing(sqlite3.connect(DB_PATH)) as conn:
-        sent = {r[0] for r in conn.execute(
-            "SELECT milestone FROM reminder_log WHERE todo_id = ?", (todo_id,)
+        sent = {item[0] for item in conn.execute(
+            "SELECT milestone FROM reminder_log WHERE todo_id = ?", (row["id"],)
         ).fetchall()}
-
     due_unsent = sorted(
-        ((name, t) for name, t in milestones if t <= now and name not in sent),
-        key=lambda x: x[1],
+        ((name, time) for name, time in milestones if time <= now and name not in sent),
+        key=lambda item: item[1],
     )
     if not due_unsent:
         return
 
-    # 複数のマイルストーンが同時に溜まっていても、最新の1件だけ通知して過去分は連投しない
     latest_name, latest_time = due_unsent[-1]
-    should_send = (now - latest_time) <= REMINDER_STALE_AFTER
+    if now - latest_time <= REMINDER_STALE_AFTER:
+        board_row = get_board_row(row["guild_id"])
+        if board_row is None:
+            return  # ボード未設定なら、後で設定した時に通知できるよう未送信のまま残す
+        channel = await _resolve_channel(board_row["channel_id"])
+        if channel is None:
+            return
+        if row["notify_type"] == "scheduled":
+            content = f"@everyone ⏰ 予定の時間になりました: **{row['task']}**（{format_jst(deadline)}）"
+        else:
+            label = {"d3": "締切まであと3日", "d1": "締切まであと1日", "h3": "締切まであと3時間"}[latest_name]
+            content = f"@everyone ⚠️ {label}: **{row['task']}**（締切 {format_jst(deadline)}）"
+        try:
+            await channel.send(content, allowed_mentions=EVERYONE_ONLY)
+        except discord.HTTPException as exc:
+            print(f"[reminder] 送信失敗 todo_id={row['id']}: {exc}")
+            return
 
-    if should_send:
-        channel = await _resolve_channel(row["channel_id"])
-        if channel is not None:
-            content = _build_reminder_content(row, latest_name, deadline)
-            try:
-                await channel.send(content, allowed_mentions=EVERYONE_ONLY)
-            except Exception as e:  # noqa: BLE001 - 送信失敗時は既読にせず次回リトライ
-                print(f"[reminder] 送信失敗 todo_id={todo_id}: {e}")
-                return
-
-    sent_at = now.isoformat()
+    # 過去分を連投しないため、今回までに期限を迎えた分を一度に処理済みにする。
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.executemany(
             "INSERT OR IGNORE INTO reminder_log (todo_id, milestone, sent_at) VALUES (?, ?, ?)",
-            [(todo_id, name, sent_at) for name, _ in due_unsent],
+            [(row["id"], name, now.isoformat()) for name, _ in due_unsent],
         )
         conn.commit()
+    await refresh_board_if_configured(row["guild_id"])
 
-
-def _build_reminder_content(row: sqlite3.Row, milestone_name: str, deadline: datetime) -> str:
-    task = row["task"]
-    deadline_txt = format_jst(deadline)
-    if row["notify_type"] == "scheduled":
-        return f"@everyone ⏰ 予定の時間になりました: **{task}**（{deadline_txt}）"
-    label = {"d3": "締切まであと3日", "d1": "締切まであと1日", "h3": "締切まであと3時間"}[milestone_name]
-    return f"@everyone ⚠️ {label}: **{task}**（締切 {deadline_txt}）"
-
-
-# ============================================================
-# 起動処理
-# ============================================================
 
 @bot.event
 async def on_ready():
